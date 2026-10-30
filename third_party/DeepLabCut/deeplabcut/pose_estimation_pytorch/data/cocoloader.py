@@ -1,0 +1,428 @@
+#
+# DeepLabCut Toolbox (deeplabcut.org)
+# © A. & M.W. Mathis Labs
+# https://github.com/DeepLabCut/DeepLabCut
+#
+# Please see AUTHORS for contributors.
+# https://github.com/DeepLabCut/DeepLabCut/blob/main/AUTHORS
+#
+# Licensed under GNU Lesser General Public License v3.0
+#
+from __future__ import annotations
+
+import json
+import warnings
+from pathlib import Path
+
+import numpy as np
+
+from deeplabcut.core.deprecation import renamed_parameter
+from deeplabcut.pose_estimation_pytorch.config import MethodType, PoseConfig
+from deeplabcut.pose_estimation_pytorch.data.base import Loader
+from deeplabcut.pose_estimation_pytorch.data.dataset import PoseDatasetParameters
+from deeplabcut.pose_estimation_pytorch.data.utils import (
+    map_id_to_annotations,
+    map_image_path_to_id,
+)
+
+
+class COCOLoader(Loader):
+    """
+    Attributes:
+        project_root: root directory path of the COCO project.
+        model_config_path: path to the pytorch_config.yaml file
+        train_json_filename: the name of the json file containing the train annotations
+        test_json_filename: the name of the json file containing the train annotations.
+            None if there is no test set.
+        model_cfg: the model configuration instead of loading from file
+
+    Examples:
+        loader = COCOLoader(
+            project_root='/path/to/project/',
+            model_config='/path/to/project/experiments/train/pytorch_config.yaml',
+            train_json_filename="train.json",
+            test_json_filename="test.json",
+        )
+    """
+
+    @renamed_parameter(old="model_config_path", new="model_config", since="3.0.0")
+    def __init__(
+        self,
+        project_root: str | Path,
+        model_config: PoseConfig | dict | Path | str | None = None,
+        train_json_filename: str = "train.json",
+        test_json_filename: str = "test.json",
+    ):
+        """
+        Initialize the COCOLoader.
+
+        Args:
+            project_root: The root directory of the project.
+            model_config: The pose model configuration. Can be a path to a YAML
+                file, a PoseConfig object, or a dictionary.
+            train_json_filename: The name of the JSON file containing the train annotations.
+            test_json_filename: The name of the JSON file containing the test annotations.
+        """
+        image_root = Path(project_root) / "images"
+        super().__init__(project_root, image_root, model_config)
+        self.train_json_filename = train_json_filename
+        self.test_json_filename = test_json_filename
+        self._dataset_parameters = None
+
+        self.train_json = self.load_json(self.project_root, self.train_json_filename)
+        self.test_json = None
+        if self.test_json_filename:
+            self.test_json = self.load_json(self.project_root, self.test_json_filename)
+
+        self._validate_against_model_cfg()
+
+    def _validate_against_model_cfg(self) -> None:
+        """Checks that the COCO annotations are compatible with `model_cfg.metadata`.
+        `model_cfg.metadata` is authoritative for `bodyparts` and `individuals`
+        (the pose model is built with these parameters, and the COCO JSON should match).
+
+        Raises:
+            ValueError: If an image has more individuals than `model_cfg` supports, or
+                if the annotated bodyparts don't match `model_cfg.metadata.bodyparts`.
+        """
+        meta = self.model_cfg.metadata
+        bodyparts = list(meta.bodyparts)
+
+        for name, coco_json in (("train", self.train_json), ("test", self.test_json)):
+            if coco_json is None:
+                continue
+
+            json_bodyparts = list(coco_json["categories"][0]["keypoints"])
+            if json_bodyparts != bodyparts:
+                raise ValueError(
+                    f"The bodyparts in {self.train_json_filename if name == 'train' else self.test_json_filename} "
+                    f"({json_bodyparts}) don't match model_cfg.metadata.bodyparts ({bodyparts}). The order must "
+                    "match exactly, as it determines which keypoint index is associated with which bodypart name."
+                )
+
+            observed = self._max_individuals_in_json(coco_json)
+            if observed > meta.num_individuals:
+                raise ValueError(
+                    f"{self.train_json_filename if name == 'train' else self.test_json_filename} has an image "
+                    f"with {observed} individuals, but model_cfg only supports {meta.num_individuals} "
+                    f"(metadata.individuals={list(meta.individuals)}). Rebuild the model config with "
+                    f"max_individuals >= {observed} before training/evaluating on this dataset."
+                )
+
+    @staticmethod
+    def _max_individuals_in_json(coco_json: dict) -> int:
+        """Returns the max number of annotations on any single image in a COCO dict."""
+        img_to_annotations = map_id_to_annotations(coco_json.get("annotations") or [])
+        if not img_to_annotations:
+            return 0
+        return max(len(ann_ids) for ann_ids in img_to_annotations.values())
+
+    def get_dataset_parameters(self) -> PoseDatasetParameters:
+        """Retrieves dataset parameters based on the instance's configuration.
+
+        Returns:
+            An instance of the PoseDatasetParameters with the parameters set.
+        """
+        if self._dataset_parameters is None:
+            meta = self.model_cfg.metadata
+            bodyparts = meta.bodyparts
+            individuals = meta.individuals
+
+            crop_cfg = self.model_cfg.select("data.train.top_down_crop") or {}
+            crop_w, crop_h = crop_cfg.get("width", 256), crop_cfg.get("height", 256)
+            crop_margin = crop_cfg.get("margin", 0)
+            crop_with_context = crop_cfg.get("crop_with_context", True)
+
+            ctd_bbox_margin = None
+            if self.model_cfg["method"] == MethodType.CONDITIONAL_TOP_DOWN:
+                ctd_bbox_margin = self.model_cfg["data"].get("bbox_margin", 20)
+
+            self._dataset_parameters = PoseDatasetParameters(
+                bodyparts=bodyparts,
+                unique_bpts=meta.unique_bodyparts,
+                individuals=individuals,
+                with_center_keypoints=self.model_cfg.get("with_center_keypoints", False),
+                color_mode=self.model_cfg.get("color_mode", "RGB"),
+                ctd_bbox_margin=ctd_bbox_margin,
+                top_down_crop_size=(crop_w, crop_h),
+                top_down_crop_margin=crop_margin,
+                top_down_crop_with_context=crop_with_context,
+            )
+
+        return self._dataset_parameters
+
+    @staticmethod
+    def load_json(project_root: str | Path, filename: str) -> dict:
+        """Load a JSON file from the annotations directory.
+
+        Args:
+            project_root: path to the root directory for the project
+            filename: filename of JSON file to load
+
+        Returns:
+            json_obj: JSON object loaded from the file
+
+        Raises:
+            FileNotFoundError: If the file does not exist
+            ValueError: If the object stored in the file is not a dict
+
+        Examples:
+            Check https://docs.trainingdata.io/v1.0/Export%20Format/COCO/ to see
+            examples of how a json file looks like.
+        """
+        json_path = Path(project_root) / "annotations" / filename
+        if not json_path.exists():
+            raise FileNotFoundError(f"File {json_path} does not exist.")
+
+        with json_path.open() as f:
+            json_obj = json.load(f)
+
+        if not isinstance(json_obj, dict):
+            raise ValueError("COCO datasets need to be saved in JSON Objects")
+
+        return json_obj
+
+    @staticmethod
+    def validate_categories(coco_json: dict) -> dict:
+        """Checks that the categories for the COCO project are valid.
+
+        Checks that there is no category with ID 0 in the dataset, as this causes issues
+        with torchvision object detectors (label 0 is reserved for background
+        detections). If that's the case, all category IDs are shifted by 1 such that
+        there is no longer a category 0.
+
+        Currently, detectors can only be trained with a single category. This also
+        ensures that all annotations have `category_id` set to 1.
+
+        Args:
+            coco_json: the COCO dictionary containing the annotations
+
+        Returns:
+            the validated COCO object
+        """
+        cat_0 = False
+        for cat in coco_json["categories"]:
+            if cat["id"] == 0:
+                cat_0 = cat
+                warnings.warn(
+                    f"Found a category with ID 0 ({cat}) in the COCO dataset. This is not"
+                    f" allowed, as category ID 0 is reserved as the background ID for"
+                    f" torchvision detectors. All category IDs have been shifted by 1.",
+                    stacklevel=2,
+                )
+
+        if len(coco_json["categories"]) > 1:
+            warnings.warn(
+                "Found more than 1 category in the project. This is currently not"
+                " supported in DeepLabCut. All annotations will be given category 1",
+                stacklevel=2,
+            )
+
+        if cat_0:
+            for cat in coco_json["categories"]:
+                cat["id"] = 1
+
+        if cat_0 or len(coco_json["categories"]) > 1:
+            for ann in coco_json["annotations"]:
+                ann["category_id"] = 1
+
+        return coco_json
+
+    def validate_images(self, coco_json: dict) -> dict:
+        """Goes over images and annotations to look for potential errors.
+
+        This code tries to ensure that training a model on this project does not crash
+        down the line
+
+        Completes relative image filepaths to '/project_root/images/file_name'. Absolute
+        filepaths are not updated (which allows storing images to be stored in a folder
+        other than the project root) Then checks that all images files exist in the file
+        system.
+
+        Args:
+            coco_json (dict): The COCO dictionary containing the annotations
+
+        Returns:
+            the validated COCO object
+        """
+        image_ids = set()
+        missing_images = {}
+        validated_images = []
+        for image in coco_json["images"]:
+            image_filename = Path(image["file_name"])
+            if image_filename.is_absolute():
+                image_path = image_filename
+            else:
+                image_path = self.image_root / image["file_name"]
+                image["file_name"] = str(image_path)
+
+            if not image_path.exists():
+                missing_images[image["id"]] = image["file_name"]
+            else:
+                validated_images.append(image)
+                image_ids.add(image["id"])
+
+        if len(missing_images) > 0:
+            warnings.warn(f"There are {len(missing_images)} images that cannot be found (here are some):", stacklevel=2)
+            for img_id, file_name in missing_images.items():
+                print(f"  * {img_id}: {file_name}")
+
+        coco_json["images"] = validated_images
+
+        if len(missing_images) > 0:
+            validated_annotations = []
+            for ann in coco_json["annotations"]:
+                if ann["image_id"] not in missing_images:
+                    validated_annotations.append(ann)
+
+            coco_json["annotations"] = validated_annotations
+
+        validated_annotations = []
+        for ann in coco_json["annotations"]:
+            if ann["image_id"] in image_ids:
+                validated_annotations.append(ann)
+
+        if len(coco_json["annotations"]) < len(validated_annotations):
+            warnings.warn(
+                "Found some annotations for which the image ID was not in the images. Removing them from the dataset.",
+                stacklevel=2,
+            )
+            print(f"  All annotations: {len(coco_json['annotations'])}")
+            print(f"  Annotations with correct image IDs: {len(validated_annotations)}")
+            coco_json["annotations"] = validated_annotations
+
+        return coco_json
+
+    def load_data(self, mode: str = "train") -> dict:
+        """Convert data from JSON object to dictionary.
+
+        Args:
+            mode: indicates which JSON object to convert. Defaults to "train".
+
+        Returns:
+            the train or test data
+        """
+        if mode == "train":
+            data = self.train_json
+        elif mode == "test":
+            data = self.test_json
+        else:
+            raise AttributeError(f"Unknown mode: {mode}")
+
+        data = COCOLoader.validate_categories(data)
+        data = self.validate_images(data)
+
+        annotations_per_image = {}
+        for annotation in data["annotations"]:
+            annotation["keypoints"] = np.array(annotation["keypoints"], dtype=float)
+            annotation["bbox"] = np.array(annotation["bbox"], dtype=float)
+
+            # set individual index
+            image_id = annotation["image_id"]
+            individual_idx = annotations_per_image.get(image_id, 0)
+            annotation["individual"] = f"individual{individual_idx}"
+            annotations_per_image[image_id] = individual_idx + 1
+
+        filter_annotations = []
+        for annotation in data["annotations"]:
+            keypoints = annotation["keypoints"]
+            bbox = annotation["bbox"]
+            if np.all(keypoints <= 0) or len(bbox) == 0:
+                continue
+            filter_annotations.append(annotation)
+
+        data["annotations"] = filter_annotations
+
+        # FIXME: why estimating bbox when there are already bbox?
+        annotations_with_bbox = self._compute_bboxes(
+            data["images"],
+            data["annotations"],
+            method="gt",
+        )
+        data["annotations"] = annotations_with_bbox
+        return data
+
+    @staticmethod
+    def get_project_parameters(
+        train_json: dict,
+        test_json: dict | None = None,
+    ) -> tuple[int, list[str]]:
+        """Suggests parameters for a project, given its COCO-format JSON annotation(s).
+
+        Use this to pick `bodyparts`/`max_individuals` when building a `PoseConfig` for
+        a new COCO project (e.g. before calling `make_pytorch_pose_config`). Once a
+        model config exists, it becomes authoritative for the dataset (see
+        `COCOLoader.get_dataset_parameters`) - this helper is only meant to bootstrap
+        it from the data.
+
+        Args:
+            train_json: the json dictionary containing the data for training
+            test_json: the json dictionary containing the data for testing/evaluation,
+                if any. Passing this ensures the suggested number of individuals also
+                covers the test set, so a model trained with it doesn't fail during
+                evaluation because a test image has more individuals than train ever did.
+
+        Returns:
+            int: the maximum number of individuals in a single image, across train
+                (and test, if given)
+            list[str]: the name of keypoints annotated in this project
+
+        Raises:
+            ValueError: If the train JSON contains no images.
+        """
+        train_json = COCOLoader.validate_categories(train_json)
+        bodyparts = train_json["categories"][0]["keypoints"]
+
+        num_individuals = COCOLoader._max_individuals_in_json(train_json)
+        if num_individuals == 0:
+            raise ValueError(f"No images found in the dataset: {train_json}!")
+
+        if test_json is not None:
+            test_json = COCOLoader.validate_categories(test_json)
+            num_individuals = max(num_individuals, COCOLoader._max_individuals_in_json(test_json))
+
+        return num_individuals, bodyparts
+
+    def predictions_to_coco(
+        self,
+        predictions: dict[str, dict[str, np.ndarray]],
+        mode: str = "train",
+    ) -> list[dict]:
+        """Converts detections to COCO format.
+
+        Args:
+            predictions: a dictionary mapping image name to the predictions made for it
+            mode: {"train", "test"} the mode that the predictions were made with
+
+        Returns:
+            The COCO-format predictions
+        """
+        data = self.load_data(mode)
+        image_path_to_id = map_image_path_to_id(data["images"])
+
+        # TODO: no unique bodyparts for COCO
+        coco_predictions = []
+        for image_path, pred in predictions.items():
+            image_id = image_path_to_id[image_path]
+
+            # Shape (num_individuals, num_keypoints, 3)
+            individuals = pred["bodyparts"]
+            for idx, keypoints in enumerate(individuals):
+                if not np.all(keypoints == -1):
+                    score = np.mean(keypoints[:, 2]).item()
+                    keypoints = keypoints.copy()
+                    keypoints[:, 2] = 2  # set visibility instead of score
+                    coco_pred = {
+                        "image_id": int(image_id),
+                        "category_id": 1,  # TODO: get category ID from prediction?
+                        "keypoints": keypoints.reshape(-1).tolist(),
+                        "score": float(score),
+                    }
+                    if "bboxes" in pred:
+                        coco_pred["bbox"] = pred["bboxes"][idx].reshape(-1).tolist()
+                    if "bbox_scores" in pred:
+                        coco_pred["bbox_scores"] = pred["bbox_scores"][idx].reshape(-1).tolist()
+
+                    coco_predictions.append(coco_pred)
+
+        return coco_predictions

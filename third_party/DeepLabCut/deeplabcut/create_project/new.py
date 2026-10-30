@@ -1,0 +1,297 @@
+#
+# DeepLabCut Toolbox (deeplabcut.org)
+# © A. & M.W. Mathis Labs
+# https://github.com/DeepLabCut/DeepLabCut
+#
+# Please see AUTHORS for contributors.
+# https://github.com/DeepLabCut/DeepLabCut/blob/master/AUTHORS
+#
+# Licensed under GNU Lesser General Public License v3.0
+#
+
+
+import os
+import shutil
+import warnings
+from collections.abc import Sequence
+from pathlib import Path
+from typing import Literal
+
+from deeplabcut import DEBUG
+from deeplabcut.core.deprecation import renamed_parameter
+from deeplabcut.core.engine import Engine
+from deeplabcut.utils.auxfun_videos import VideoReader, collect_video_paths
+
+
+@renamed_parameter(old="videotype", new="video_extensions", since="3.0.0")
+def create_new_project(
+    project: str,
+    experimenter: str,
+    videos: list[str | Path],
+    working_directory: str | Path | None = None,
+    copy_videos: bool = False,
+    video_extensions: str | Sequence[str] | None = None,
+    multianimal: bool = False,
+    individuals: list[str] | None = None,
+) -> Path | Literal["nothingcreated"]:
+    r"""Create the necessary folders and files for a new project.
+
+    Creating a new project involves creating the project directory, sub-directories and
+    a basic configuration file. The configuration file is loaded with the default
+    values. Change its parameters to your projects need.
+
+    Args:
+        project (string): The name of the project.
+        experimenter (string): The name of the experimenter.
+        videos (list[str | Path]): A list of strings or paths representing the full
+            paths of the videos or video-directories to include in the project. If a
+            path represents a directory instead of a file, all videos of
+            ``video_extensions`` will be imported.
+        working_directory (str | Path | None, optional): The directory where the
+            project will be created. The default is the ``current working directory``.
+        copy_videos (bool, optional): If True, the videos are copied to the ``videos``
+            directory. If False, symlinks of the videos will be created in the
+            ``project/videos`` directory; in the event of a failure to create symbolic
+            links, videos will be moved instead. Defaults to False.
+        video_extensions (str | Sequence[str] | None, optional):
+            Controls how ``videos`` are filtered, based on file extension.
+            File paths and directory contents are treated differently:
+            - ``None`` (default): file paths are accepted as-is; directories are
+              scanned for files with a recognized video extension.
+            - ``str`` or ``Sequence[str]`` (e.g. ``"mp4"`` or ``["mp4", "avi"]``):
+              both file paths and directory contents are filtered by the given
+              extension(s). Defaults to None.
+        multianimal (bool, optional): For creating a multi-animal project (introduced
+            in DLC 2.2). Defaults to False.
+        individuals (list[str] | None, optional): Relevant only if multianimal is True.
+            List of individuals to be used in the project configuration. If None,
+            defaults to ['individual1', 'individual2', 'individual3'].
+
+    Returns:
+        Path | Literal["nothingcreated"]: Path to the new project configuration file,
+        or ``"nothingcreated"`` if no valid videos were found.
+
+    Raises:
+        FileNotFoundError: If a non-existent path is passed to ``videos``.
+
+    Examples:
+        Linux/MacOS:
+
+            deeplabcut.create_new_project(
+                project='reaching-task',
+                experimenter='Linus',
+                videos=[
+                    '/data/videos/mouse1.avi',
+                    '/data/videos/mouse2.avi',
+                    '/data/videos/mouse3.avi'
+                ],
+                working_directory='/analysis/project/',
+            )
+            deeplabcut.create_new_project(
+                project='reaching-task',
+                experimenter='Linus',
+                videos=['/data/videos'],
+                video_extensions='.mp4',
+            )
+
+        Windows:
+
+            deeplabcut.create_new_project(
+                'reaching-task',
+                'Bill',
+                [r'C:\yourusername\rig-95\Videos\reachingvideo1.avi'],
+                copy_videos=True,
+            )
+
+        On Windows, paths should be formatted as ``r`"C:\"`` or ``"C:\\"`` (i.e. a double backslash).
+    """
+    from datetime import datetime as dt
+
+    from deeplabcut.utils import auxiliaryfunctions
+
+    months_3letter = {
+        1: "Jan",
+        2: "Feb",
+        3: "Mar",
+        4: "Apr",
+        5: "May",
+        6: "Jun",
+        7: "Jul",
+        8: "Aug",
+        9: "Sep",
+        10: "Oct",
+        11: "Nov",
+        12: "Dec",
+    }
+
+    date = dt.today()
+    month = months_3letter[date.month]
+    day = date.day
+    d = str(month[0:3] + str(day))
+    date = dt.today().strftime("%Y-%m-%d")
+    if working_directory is None:
+        working_directory = "."
+    wd = Path(working_directory).absolute()
+    project_name = f"{project}-{experimenter}-{date}"
+    project_path = wd / project_name
+
+    # Create project and sub-directories
+    if not DEBUG and project_path.exists():
+        print(f'Project "{project_path}" already exists!')
+        return (project_path / "config.yaml").absolute()
+    video_path = project_path / "videos"
+    data_path = project_path / "labeled-data"
+    shuffles_path = project_path / "training-datasets"
+    results_path = project_path / "dlc-models"
+    for p in [video_path, data_path, shuffles_path, results_path]:
+        p.mkdir(parents=True, exist_ok=DEBUG)
+        print(f'Created "{p}"')
+
+    # Add all videos in the folder. Multiple folders can be passed in a list,
+    # similar to the video files. Folders and video files can also be passed!
+    collected_videos: list[Path] = collect_video_paths(videos, extensions=video_extensions)
+
+    # TODO @deruyter92 2026-05-20: Move this verbosity block to `collect_video_paths` instead
+    files_per_dir: dict[Path, int] = {}
+    for f in collected_videos:
+        files_per_dir[f.parent] = files_per_dir.get(f.parent, 0) + 1
+    for dir, count in files_per_dir.items():
+        print(f"Found {count} videos in {dir}")
+    for p in (Path(v) for v in videos if Path(v).is_dir()):
+        if p.absolute() not in {d.absolute() for d in files_per_dir}:
+            print(f"No videos found in {p}")
+            print(f"Perhaps change the video_extensions, which is currently set to: {video_extensions}")
+
+    videos = collected_videos
+    dirs = [data_path / i.stem for i in videos]
+    for p in dirs:
+        """Creates directory under data."""
+        p.mkdir(parents=True, exist_ok=True)
+
+    destinations = [video_path.joinpath(vp.name) for vp in videos]
+    if copy_videos:
+        print("Copying the videos")
+        for src, dst in zip(videos, destinations, strict=False):
+            shutil.copy(os.fspath(src), os.fspath(dst))  # https://www.python.org/dev/peps/pep-0519/
+    else:
+        # creates the symlinks of the video and puts it in the videos directory.
+        print("Attempting to create a symbolic link of the video ...")
+        for src, dst in zip(videos, destinations, strict=False):
+            if dst.exists() and not DEBUG:
+                raise FileExistsError(f"Video {dst} exists already!")
+            try:
+                dst.symlink_to(src)
+                print(f"Created the symlink of {src} to {dst}")
+            except OSError:
+                try:
+                    import subprocess
+
+                    subprocess.check_call(f"mklink {os.fspath(dst)} {os.fspath(src)}", shell=True)
+                except (OSError, subprocess.CalledProcessError):
+                    print("Symlink creation impossible (exFat architecture?): copying the video instead.")
+                    shutil.copy(os.fspath(src), os.fspath(dst))
+                    print(f"{src} copied to {dst}")
+            videos = destinations
+
+    if copy_videos:
+        videos = destinations  # in this case the *new* location should be added to the config file
+
+    # adds the video list to the config.yaml file
+    video_sets = {}
+    for video in videos:
+        print(video)
+        video_key = Path(video).absolute()
+
+        try:
+            vid = VideoReader(os.fspath(video_key))
+            video_sets[os.fspath(video_key)] = {"crop": ", ".join(map(str, vid.get_bbox()))}
+        except OSError:
+            warnings.warn("Cannot open the video file! Skipping to the next one...", stacklevel=2)
+            Path(video).unlink()  # Removing the video or link from the project
+
+    if not len(video_sets):
+        # Silently sweep the files that were already written.
+        shutil.rmtree(project_path, ignore_errors=True)
+        warnings.warn(
+            "No valid videos were found. The project was not created... "
+            "Verify the video files and re-create the project.",
+            stacklevel=2,
+        )
+        return "nothingcreated"
+
+    # Set values to config file:
+    if multianimal:  # parameters specific to multianimal project
+        cfg_file, ruamelFile = auxiliaryfunctions.create_config_template(multianimal)
+        cfg_file["multianimalproject"] = multianimal
+        cfg_file["identity"] = False
+        cfg_file["individuals"] = individuals if individuals else ["individual1", "individual2", "individual3"]
+        cfg_file["multianimalbodyparts"] = ["bodypart1", "bodypart2", "bodypart3"]
+        cfg_file["uniquebodyparts"] = []
+        cfg_file["bodyparts"] = "MULTI!"
+        cfg_file["skeleton"] = [
+            ["bodypart1", "bodypart2"],
+            ["bodypart2", "bodypart3"],
+            ["bodypart1", "bodypart3"],
+        ]
+        engine = cfg_file.get("engine")
+        if engine in Engine.PYTORCH.aliases:
+            cfg_file["default_augmenter"] = "albumentations"
+            cfg_file["default_net_type"] = "resnet_50"
+        elif engine in Engine.TF.aliases:
+            cfg_file["default_augmenter"] = "multi-animal-imgaug"
+            cfg_file["default_net_type"] = "dlcrnet_ms5"
+        else:
+            raise ValueError(f"Unknown or undefined engine {engine}")
+        cfg_file["default_track_method"] = "ellipse"
+    else:
+        cfg_file, ruamelFile = auxiliaryfunctions.create_config_template()
+        cfg_file["multianimalproject"] = False
+        cfg_file["bodyparts"] = ["bodypart1", "bodypart2", "bodypart3", "objectA"]
+        cfg_file["skeleton"] = [["bodypart1", "bodypart2"], ["objectA", "bodypart3"]]
+        cfg_file["default_augmenter"] = "default"
+        cfg_file["default_net_type"] = "resnet_50"
+
+    # common parameters:
+    cfg_file["Task"] = project
+    cfg_file["scorer"] = experimenter
+    cfg_file["video_sets"] = video_sets
+    cfg_file["project_path"] = project_path
+    cfg_file["date"] = d
+    cfg_file["cropping"] = False
+    cfg_file["start"] = 0
+    cfg_file["stop"] = 1
+    cfg_file["numframes2pick"] = 20
+    cfg_file["TrainingFraction"] = [0.95]
+    cfg_file["iteration"] = 0
+    cfg_file["snapshotindex"] = -1
+    cfg_file["detector_snapshotindex"] = -1
+    cfg_file["x1"] = 0
+    cfg_file["x2"] = 640
+    cfg_file["y1"] = 277
+    cfg_file["y2"] = 624
+    cfg_file["batch_size"] = (
+        8  # batch size during inference (video - analysis); see https://www.biorxiv.org/content/early/2018/10/30/457242
+    )
+    cfg_file["detector_batch_size"] = 1
+    cfg_file["corner2move2"] = (50, 50)
+    cfg_file["move2corner"] = True
+    cfg_file["skeleton_color"] = "black"
+    cfg_file["pcutoff"] = 0.6
+    cfg_file["dotsize"] = 12  # for plots size of dots
+    cfg_file["alphavalue"] = 0.7  # for plots transparency of markers
+    cfg_file["colormap"] = "rainbow"  # for plots type of colormap
+
+    projconfigfile = (project_path / "config.yaml").absolute()
+    # Write dictionary to yaml  config file
+    auxiliaryfunctions.write_config(projconfigfile, cfg_file)
+
+    print('Generated "{}"'.format(project_path / "config.yaml"))
+    print(
+        f"\nA new project with name {project_name} is created at {str(wd)} "
+        "and a configurable file (config.yaml) is stored there. "
+        "Change the parameters in this file to adapt to your project's needs.\n "
+        "Once you have changed the configuration file, "
+        "use the function 'extract_frames' to select frames for labeling.\n. "
+        "[OPTIONAL] Use the function 'add_new_videos' to add new videos to your project (at any stage)."
+    )
+    return projconfigfile

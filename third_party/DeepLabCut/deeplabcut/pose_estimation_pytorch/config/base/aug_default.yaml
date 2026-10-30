@@ -1,0 +1,18 @@
+bbox_margin: 20
+colormode: RGB
+inference:
+  normalize_images: true
+train:
+  affine:
+    p: 0.5
+    rotation: 30
+    scaling: [0.5, 1.25]
+    translation: 0
+  crop_sampling:
+    width: 448
+    height: 448
+    max_shift: 0.1
+    method: hybrid
+  gaussian_noise: 12.75
+  motion_blur: true
+  normalize_images: true

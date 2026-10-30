@@ -1,0 +1,286 @@
+#
+# DeepLabCut Toolbox (deeplabcut.org)
+# © A. & M.W. Mathis Labs
+# https://github.com/DeepLabCut/DeepLabCut
+#
+# Please see AUTHORS for contributors.
+# https://github.com/DeepLabCut/DeepLabCut/blob/master/AUTHORS
+#
+# Licensed under GNU Lesser General Public License v3.0
+#
+
+import shutil
+import tarfile
+from pathlib import Path
+
+import tensorflow as tf
+
+from deeplabcut.core.config import get_yaml_dumper, get_yaml_loader
+from deeplabcut.pose_estimation_tensorflow.config import load_config
+from deeplabcut.pose_estimation_tensorflow.core import predict
+from deeplabcut.utils import auxiliaryfunctions
+
+
+def create_deploy_config_template():
+    """
+
+    TODO: WIP
+
+    Creates a template for config.yaml file.
+    This specific order is preserved while saving as yaml file.
+    """
+    yaml_str = """\
+# Deploy config.yaml - info about project origin:
+    Task:
+    scorer:
+    date:
+    \n
+# Project path
+    project_path:
+    \n
+# Annotation data set configuration (and individual video cropping parameters)
+    video_sets:
+    bodyparts:
+    \n
+# Plotting configuration
+    skeleton:
+    skeleton_color:
+    \n
+    """
+
+    ruamelFile = get_yaml_loader()
+    cfg_file = ruamelFile.load(yaml_str)
+    return cfg_file, ruamelFile
+
+
+def write_deploy_config(configname, cfg):
+    """CURRENTLY NOT IMPLEMENTED.
+
+    Write structured config file.
+    """
+    with open(configname, "w") as cf:
+        ruamelFile = get_yaml_loader()
+        cfg_file, ruamelFile = create_deploy_config_template()
+        for key in cfg.keys():
+            cfg_file[key] = cfg[key]
+
+        # Adding default value for variable skeleton and skeleton_color for backward compatibility.
+        if "skeleton" not in cfg.keys():
+            cfg_file["skeleton"] = []
+            cfg_file["skeleton_color"] = "black"
+        ruamelFile.dump(cfg_file, cf)
+
+
+def load_model(cfg, shuffle=1, trainingsetindex=0, TFGPUinference=True, modelprefix=""):
+    """Load a TensorFlow session with a DLC model from the associated configuration.
+
+    Args:
+        cfg (dict): Configuration read from the project's main config.yaml file.
+        shuffle (int, optional): Which shuffle to use.
+        trainingsetindex (int, optional): Which training fraction to use, identified by
+            its index.
+        TFGPUinference (bool, optional): Use tensorflow inference model? Defaults to
+            True.
+
+    Returns:
+        tuple: sess, input, output, and dlc_cfg where sess is a tensorflow session with
+            DLC model from the provided configuration, shuffle, and trainingsetindex.
+    """
+    ########################
+    ### find snapshot to use
+    ########################
+
+    train_fraction = cfg["TrainingFraction"][trainingsetindex]
+    model_folder = Path(cfg["project_path"]) / str(
+        auxiliaryfunctions.get_model_folder(train_fraction, shuffle, cfg, modelprefix=modelprefix)
+    )
+    Path(model_folder) / "test" / "pose_cfg.yaml"
+    path_train_config = Path(model_folder) / "train" / "pose_cfg.yaml"
+
+    try:
+        dlc_cfg = load_config(str(path_train_config))
+        # dlc_cfg_train = load_config(str(path_train_config))
+    except FileNotFoundError as e:
+        raise FileNotFoundError(
+            f"It seems the model for shuffle {shuffle} and trainFraction {train_fraction} does not exist."
+        ) from e
+
+    Snapshots = auxiliaryfunctions.get_snapshots_from_folder(
+        train_folder=Path(model_folder) / "train",
+    )
+
+    if cfg["snapshotindex"] == "all":
+        print("Snapshotindex is set to 'all' in the config.yaml file. Changing snapshot index to -1!")
+        snapshotindex = -1
+    else:
+        snapshotindex = cfg["snapshotindex"]
+
+    ####################################
+    ### Load and setup CNN part detector
+    ####################################
+
+    # Check if data already was generated:
+    dlc_cfg["init_weights"] = str(Path(model_folder) / "train" / Snapshots[snapshotindex])
+    Path(dlc_cfg["init_weights"]).name.split("-")[-1]
+    dlc_cfg["num_outputs"] = cfg.get("num_outputs", dlc_cfg.get("num_outputs", 1))
+    dlc_cfg["batch_size"] = None
+
+    # load network
+    if TFGPUinference:
+        sess, _, _ = predict.setup_GPUpose_prediction(dlc_cfg)
+        output = ["concat_1"]
+    else:
+        sess, _, _ = predict.setup_pose_prediction(dlc_cfg)
+        if dlc_cfg["location_refinement"]:
+            output = ["Sigmoid", "pose/locref_pred/block4/BiasAdd"]
+        else:
+            output = ["Sigmoid", "pose/part_pred/block4/BiasAdd"]
+
+    input = tf.compat.v1.get_default_graph().get_operations()[0].name
+
+    return sess, input, output, dlc_cfg
+
+
+def tf_to_pb(sess, checkpoint, output, output_dir=None):
+    """Saves a frozen tensorflow graph (a protobuf file).
+
+    See also https://leimao.github.io/blog/Save-Load-Inference-From-TF-Frozen-Graph/
+
+    Args:
+        sess: Session with graph to be saved.
+        checkpoint (string): Checkpoint of tensorflow model to be converted to protobuf
+            (output will be <checkpoint>.pb).
+        output (list of strings): List of the names of output nodes (is returned by
+            load_models).
+        output_dir (string, optional): Path to the directory that exported models should
+            be saved to. If None, will export to the directory of the checkpoint file.
+    """
+
+    output_dir = Path(output_dir).expanduser() if output_dir else Path(checkpoint).parent
+    ckpt_base = Path(checkpoint).name
+
+    # save graph to pbtxt file
+    pbtxt_file = str(Path(output_dir) / (ckpt_base + ".pbtxt"))
+    tf.io.write_graph(sess.graph.as_graph_def(), "", pbtxt_file, as_text=True)
+
+    # create frozen graph from pbtxt file
+    pb_file = Path(output_dir) / (ckpt_base + ".pb")
+    frozen_graph_def = tf.compat.v1.graph_util.convert_variables_to_constants(
+        sess,
+        sess.graph_def,
+        output,
+    )
+    with Path(pb_file).open("wb") as file:
+        file.write(frozen_graph_def.SerializeToString())
+
+
+def export_model(
+    cfg_path,
+    shuffle=1,
+    trainingsetindex=0,
+    snapshotindex=None,
+    iteration=None,
+    TFGPUinference=True,
+    overwrite=False,
+    make_tar=True,
+    wipepaths=False,
+    modelprefix="",
+):
+    """Export DeepLabCut models for the model zoo or for live inference.
+
+    Saves the pose configuration, snapshot files, and frozen TF graph of the model to
+    directory named exported-models within the project directory
+
+    Args:
+        cfg_path (string): Path to the DLC Project config.yaml file.
+        shuffle (int, optional): The shuffle of the model to export. Defaults to 1.
+        trainingsetindex (int, optional): The index of the training fraction for the
+            model you wish to export. Defaults to 1.
+        snapshotindex (int, optional): The snapshot index for the weights you wish to
+            export. If None, uses the snapshotindex as defined in 'config.yaml'.
+            Defaults to None.
+        iteration (int, optional): The model iteration (active learning loop) you wish
+            to export. If None, the iteration listed in the config file is used.
+        TFGPUinference (bool, optional): Use the tensorflow inference model? Default =
+            True. For inference using DeepLabCut-live, it is recommended to set
+            TFGPIinference=False.
+        overwrite (bool, optional): If the model you wish to export has already been
+            exported, whether to overwrite. Defaults to False.
+        make_tar (bool, optional): Do you want to compress the exported directory to a
+            tar file? Default = True. This is necessary to export to the model zoo, but
+            not for live inference.
+        wipepaths (bool, optional): Removes the actual path of your project and the
+            init_weights from pose_cfg.
+
+    Examples:
+        Export the first stored snapshot for model trained with shuffle 3:
+
+            deeplabcut.export_model("/analysis/project/reaching-task/config.yaml", shuffle=3, snapshotindex=-1)
+    """
+    ### read config file
+
+    try:
+        cfg = auxiliaryfunctions.read_config(cfg_path)
+    except FileNotFoundError:
+        FileNotFoundError(f"The config.yaml file at {cfg_path} does not exist.")
+
+    cfg["project_path"] = Path(cfg_path).absolute().parent
+    cfg["iteration"] = iteration if iteration is not None else cfg["iteration"]
+    cfg["batch_size"] = cfg["batch_size"] if cfg["batch_size"] > 1 else 2
+    cfg["snapshotindex"] = snapshotindex if snapshotindex is not None else cfg["snapshotindex"]
+
+    ### load model
+
+    sess, input, output, dlc_cfg = load_model(cfg, shuffle, trainingsetindex, TFGPUinference, modelprefix)
+    ckpt = dlc_cfg["init_weights"]
+
+    ### set up export directory
+
+    export_dir = Path(cfg["project_path"]) / "exported-models"
+    if not export_dir.is_dir():
+        export_dir.mkdir()
+
+    sub_dir_name = f"DLC_{cfg['Task']}_{dlc_cfg['net_type']}_iteration-{cfg['iteration']}_shuffle-{shuffle}"
+    full_export_dir = export_dir / sub_dir_name
+
+    if full_export_dir.is_dir():
+        if not overwrite:
+            raise FileExistsError(f"Export directory {full_export_dir} already exists. Terminating export...")
+    else:
+        full_export_dir.mkdir()
+
+    ### write pose config file
+
+    # sort dlc_cfg keys alphabetically, then save to pose_cfg.yaml in export directory
+    dlc_cfg = dict(dlc_cfg)
+    sorted_cfg = {}
+    for key, value in sorted(dlc_cfg.items()):
+        if wipepaths:
+            if key in ["init_weights", "project_path", "snapshot_prefix"]:
+                sorted_cfg[key] = "TBA"
+            else:
+                sorted_cfg[key] = value
+        else:
+            sorted_cfg[key] = value
+
+    pose_cfg_file = full_export_dir / "pose_cfg.yaml"
+    with pose_cfg_file.open("w") as f:
+        get_yaml_dumper().dump(sorted_cfg, f)
+
+    ### copy checkpoint to export directory
+
+    ckpt_files = list(Path(ckpt).parent.glob(Path(ckpt).name + "*"))
+    ckpt_dest = [full_export_dir / Path(ckf).name for ckf in ckpt_files]
+    for ckf, ckd in zip(ckpt_files, ckpt_dest, strict=False):
+        shutil.copy(ckf, ckd)
+
+    ### create pbtxt and pb files for checkpoint in export directory
+
+    tf_to_pb(sess, ckpt, output, output_dir=full_export_dir)
+
+    ### tar export directory
+
+    if make_tar:
+        tar_name = str(full_export_dir) + ".tar.gz"
+        with tarfile.open(tar_name, "w:gz") as tar:
+            tar.add(full_export_dir, arcname=full_export_dir.name)

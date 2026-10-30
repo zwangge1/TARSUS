@@ -1,0 +1,1396 @@
+#
+# DeepLabCut Toolbox (deeplabcut.org)
+# © A. & M.W. Mathis Labs
+# https://github.com/DeepLabCut/DeepLabCut
+#
+# Please see AUTHORS for contributors.
+# https://github.com/DeepLabCut/DeepLabCut/blob/master/AUTHORS
+#
+# Licensed under GNU Lesser General Public License v3.0
+#
+import logging
+import sys
+import warnings
+from enum import Enum, auto
+from functools import cached_property
+from html import escape
+from importlib.resources import files
+from importlib.util import find_spec
+from pathlib import Path
+
+import qdarkstyle
+from napari_deeplabcut import __version__ as NAPARI_DLC_VERSION
+from pydantic import ValidationError
+from PySide6 import QtCore, QtGui, QtWidgets
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QAction, QDesktopServices, QPixmap
+from PySide6.QtWidgets import (
+    QComboBox,
+    QLabel,
+    QMainWindow,
+    QMenu,
+    QMessageBox,
+    QSizePolicy,
+    QWidget,
+)
+
+import deeplabcut
+from deeplabcut import __version__ as DLC_VERSION
+from deeplabcut import auxiliaryfunctions
+from deeplabcut.core.config import ProjectConfig
+from deeplabcut.core.debug import install_debug_recorder
+from deeplabcut.core.engine import Engine
+from deeplabcut.generate_training_dataset.metadata import get_shuffle_engine
+from deeplabcut.gui import components
+from deeplabcut.gui.config_file_monitor import ConfigFileMonitor
+from deeplabcut.gui.dialogs import create_generate_debug_log_action
+from deeplabcut.gui.dialogs.config_errors import (
+    CONFIG_LOAD_ERRORS,
+    ConfigErrorReport,
+    format_config_error,
+)
+from deeplabcut.gui.gui_assets import icon_from_resource, pixmap_from_resource
+from deeplabcut.gui.tabs import (
+    AnalyzeVideos,
+    CreateTrainingDataset,
+    CreateVideos,
+    EvaluateNetwork,
+    ExtractFrames,
+    ExtractOutlierFrames,
+    LabelFrames,
+    ManageProject,
+    ModelZoo,
+    OpenProject,
+    ProjectCreator,
+    RefineTracklets,
+    TrainNetwork,
+    UnsupervizedIdTracking,
+    VideoEditor,
+)
+from deeplabcut.gui.utils import UpdateChecker, _build_update_commands, absolute_path
+from deeplabcut.gui.widgets import (
+    StreamReceiver,
+    StreamWriter,
+)
+
+warnings.filterwarnings(
+    "ignore",
+    message=r".*shibokensupport/signature/parser.py:269: RuntimeWarning: pyside_type_init:_resolve_value.*",
+    category=RuntimeWarning,
+)
+
+WINDOW_RESIZE_FACTOR = 0.8
+DEFAULT_MINIMUM_WIDTH, DEFAULT_MINIMUM_HEIGHT = 800, 600
+
+
+def _is_pose_config_validation_error(error: ValidationError) -> bool:
+    """Return True if *error* was raised by a PoseConfig model."""
+    try:
+        from deeplabcut.pose_estimation_pytorch.config.pose import PoseConfig as _PoseConfig
+    except (ImportError, RuntimeError):
+        return False
+
+    return getattr(error, "model", None) is _PoseConfig
+
+
+class ConfigErrorAction(Enum):
+    """Recovery action selected after a configuration error."""
+
+    CANCEL = auto()
+    RETRY = auto()
+
+
+class MainWindow(QMainWindow):
+    config_loaded = QtCore.Signal()
+    video_type_ = QtCore.Signal(str)
+    video_files_ = QtCore.Signal(set)
+    engine_change = QtCore.Signal(Engine)
+    shuffle_change = QtCore.Signal(int)
+    shuffle_created = QtCore.Signal(int)
+
+    def __init__(self, app):
+        super().__init__()
+        self.app = app
+        screen_size = app.screens()[0].size()
+        self.screen_width = screen_size.width()
+        self.screen_height = screen_size.height()
+        self._closing = False
+
+        self.logger = logging.getLogger("deeplabcut.gui")
+        self.console_logger = logging.getLogger("deeplabcut.gui.console")
+
+        self._config_monitor = None
+        self.config_path: Path | None = None
+        self.loaded = False
+
+        self.shuffle_value = 1
+        self.trainingset_index = 0
+        self.videotype = "mp4"
+        self.files: set[Path] = set()
+
+        self._engine = Engine.PYTORCH
+
+        # Update checks
+        self._update_process = None
+        self._update_process_output = []
+        self._update_commands = []
+        self._update_attempt_outputs = []
+        self._current_update_backend = None
+
+        self._scheduled_update_check_silent = True
+        self._update_check_timer = QtCore.QTimer(self)
+        self._update_check_timer.setSingleShot(True)
+        self._update_check_timer.timeout.connect(self._trigger_scheduled_update_check)
+        self._updater = UpdateChecker(
+            dlc_version=DLC_VERSION,
+            plugin_version=NAPARI_DLC_VERSION,
+            timeout_ms=5000,
+            parent=self,
+        )
+        self._updater.finished.connect(self._on_update_check_finished)
+
+        # Debug recorder
+        self._debug_recorder = install_debug_recorder(
+            logger_name="deeplabcut", handler_level=logging.INFO, ensure_logger_level=logging.INFO
+        )
+
+        self.default_set()
+
+        self._generate_welcome_page()
+        self.window_set()
+        self.default_set()
+
+        names = ["new_project.png", "open.png", "help.png"]
+        self.create_actions(names)
+        self.create_menu_bar()
+        self.load_settings()
+        self._toolbar = None
+        self.create_toolbar()
+
+        # Thread-safe Stdout redirector
+        self.writer = StreamWriter()
+        sys.stdout = self.writer
+        self.receiver = StreamReceiver(self.writer.queue)
+        self.receiver.new_text.connect(self.print_to_status_bar)
+
+        # create logger to also log to the console
+        logging.basicConfig()
+        self.console_logger.setLevel(logging.INFO)
+
+        self._progress_bar = QtWidgets.QProgressBar()
+        self._progress_bar.setMaximum(0)
+        self._progress_bar.hide()
+        self.status_bar.addPermanentWidget(self._progress_bar)
+
+        self._config_monitor = ConfigFileMonitor(
+            status_bar=self.status_bar,
+            on_reload=self.reload_project_config,
+            parent=self,
+        )
+
+    def print_to_status_bar(self, text):
+        self.status_bar.showMessage(text)
+        self.status_bar.repaint()
+        self.console_logger.info(text)
+
+    @property
+    def toolbar(self):
+        if self._toolbar is None:
+            self._toolbar = self.addToolBar("File")
+        return self._toolbar
+
+    @cached_property
+    def settings(self):
+        return QtCore.QSettings()
+
+    def load_settings(self):
+        filenames = self.settings.value("recent_files") or []
+        for filename in filenames:
+            self.add_recent_filename(filename)
+
+    def save_settings(self):
+        recent_files = []
+        for action in self.recentfiles_menu.actions()[::-1]:
+            recent_files.append(action.text())
+        self.settings.setValue("recent_files", recent_files)
+
+    def add_recent_filename(self, filename):
+        actions = self.recentfiles_menu.actions()
+        filenames = [action.text() for action in actions]
+        if filename in filenames:
+            return
+        action = QAction(filename, self)
+        before_action = actions[0] if actions else None
+        self.recentfiles_menu.insertAction(before_action, action)
+
+    @property
+    def config_path(self) -> Path | None:
+        return self._config_path
+
+    @config_path.setter
+    def config_path(self, value: Path | None) -> None:
+        self._config_path = value
+        self.invalidate_config_cache()
+        if self._config_monitor is not None:
+            self._config_monitor.set_path(str(value) if value is not None else None)
+
+    @property
+    def cfg(self) -> ProjectConfig | None:
+        """The loaded project configuration, read from disk and cached.
+
+        The cache is invalidated whenever ``config_path`` is assigned; retry
+        loops reset it explicitly to force a fresh read from disk.
+        """
+        if self.config_path is None:
+            return None
+        if self._cfg is None:
+            self._cfg = auxiliaryfunctions.read_config(self.config_path)
+        return self._cfg
+
+    @property
+    def engine(self) -> Engine:
+        return self._engine
+
+    @engine.setter
+    def engine(self, e: Engine) -> None:
+        if self._engine == e:
+            return
+
+        if e == e.TF:
+            if find_spec("tensorflow") is None:
+                err = ModuleNotFoundError("No module named 'tensorflow'")
+                msg = QtWidgets.QMessageBox()
+                msg.setIcon(QtWidgets.QMessageBox.Warning)
+                msg.setText("Cannot use the TensorFlow engine.")
+                msg.setInformativeText(
+                    f"Error `{err}`\nCannot use the TensorFlow engine as TensorFlow "
+                    "is not installed. To use it, install TensorFlow with\n"
+                    "    Windows/Linux:\n"
+                    "        pip install 'deeplabcut[tf]'\n"
+                    "    Apple Silicon:\n"
+                    "        pip install 'deeplabcut[apple_mchips]'\n\n"
+                    "Please switch back to the PyTorch engine to use DeepLabCut, or install TensorFlow."
+                )
+
+                msg.setWindowTitle("Info")
+                msg.setMinimumWidth(900)
+                icon = icon_from_resource("logo.png")
+                msg.setWindowIcon(icon)
+                msg.setStandardButtons(QtWidgets.QMessageBox.Ok)
+                msg.exec_()
+
+        self._engine = e
+        self.engine_change.emit(e)
+
+    @property
+    def project_folder(self) -> Path:
+        cfg = self.cfg
+        if cfg is None:
+            return Path("~/Desktop").expanduser().absolute()
+        return cfg.project_path
+
+    @property
+    def is_multianimal(self) -> bool:
+        cfg = self.cfg
+        return cfg is not None and cfg.multianimalproject
+
+    @property
+    def all_bodyparts(self) -> list:
+        cfg = self.cfg
+        if cfg is None:
+            return []
+        if cfg.multianimalproject:
+            return cfg.multianimalbodyparts
+        return cfg.bodyparts
+
+    @property
+    def all_individuals(self) -> list:
+        cfg = self.cfg
+        if cfg is not None and cfg.multianimalproject:
+            return cfg.individuals
+        return [""]
+
+    @property
+    def _selected_model_train_folder(self) -> tuple[Path, Engine]:
+        """Resolve model paths from the validated project-config snapshot."""
+        cfg = self.cfg
+        if cfg is None:
+            raise RuntimeError("No project configuration is loaded.")
+
+        shuffle = int(self.shuffle_value)
+        trainingset_index = int(self.trainingset_index)
+        engine = get_shuffle_engine(
+            cfg,
+            trainingsetindex=trainingset_index,
+            shuffle=shuffle,
+        )
+        model_folder = auxiliaryfunctions.get_model_folder(
+            cfg.TrainingFraction[trainingset_index],
+            shuffle,
+            cfg,
+            engine=engine,
+        )
+        return Path(cfg.project_path) / model_folder / "train", engine
+
+    @property
+    def pose_cfg_path(self) -> Path:
+        try:
+            train_folder, engine = self._selected_model_train_folder
+            filename = "pytorch_config.yaml" if engine == Engine.PYTORCH else "pose_cfg.yaml"
+            return train_folder / filename
+        except FileNotFoundError:
+            return (Path(deeplabcut.__file__).parent / "pose_cfg.yaml").absolute()
+
+    @property
+    def models_folder(self) -> Path:
+        try:
+            train_folder, _ = self._selected_model_train_folder
+            return train_folder
+        except FileNotFoundError:
+            return self.project_folder
+
+    @property
+    def inference_cfg_path(self) -> Path:
+        cfg = self.cfg
+        if cfg is None:
+            raise RuntimeError("No project configuration is loaded.")
+        return (
+            cfg.project_path
+            / auxiliaryfunctions.get_model_folder(
+                cfg.TrainingFraction[int(self.trainingset_index)],
+                int(self.shuffle_value),
+                cfg,
+            )
+            / "test"
+            / "inference_cfg.yaml"
+        )
+
+    def update_cfg(self, text):
+        self.config_path = Path(text).absolute() if text else None
+        self.unsupervised_id_tracking.setEnabled(self.is_transreid_available())
+
+    def update_shuffle(self, value):
+        self.shuffle_value = value
+        self.shuffle_change.emit(value)
+        self.logger.info(f"Shuffle set to {self.shuffle_value}")
+
+    @property
+    def video_type(self):
+        return self.videotype
+
+    @video_type.setter
+    def video_type(self, ext):
+        self.videotype = ext
+        self.video_type_.emit(ext)
+        self.logger.debug(f"Video type set to {self.video_type}")
+
+    @property
+    def video_files(self):
+        return self.files
+
+    def _disconnect_update_process(self, process):
+        if process is None:
+            return
+
+        for signal, slot in (
+            (process.finished, self._on_update_process_finished),
+            (process.errorOccurred, self._on_update_process_error),
+            (process.readyRead, self._drain_update_process_output),
+        ):
+            try:
+                signal.disconnect(slot)
+            except (TypeError, RuntimeError):
+                pass
+
+    def check_for_updates(self, *, silent=True, delay_ms=0):
+        """Start an update check immediately or schedule it after a delay."""
+        if self._closing:
+            return
+
+        # supersede old requests
+        if self._update_check_timer.isActive():
+            self._update_check_timer.stop()
+
+        if delay_ms > 0:
+            self._scheduled_update_check_silent = silent
+            self._update_check_timer.start(delay_ms)
+            return
+
+        self._updater.check(silent=silent)
+
+    def _trigger_scheduled_update_check(self):
+        if self._closing:
+            return
+        self._updater.check(silent=self._scheduled_update_check_silent)
+
+    def _start_next_update_command(self):
+        """Start the next update backend. Return True if one was started."""
+        if not self._update_commands:
+            return False
+
+        backend_name, program, arguments = self._update_commands.pop(0)
+        self._current_update_backend = backend_name
+
+        self.status_bar.showMessage(f"Installing updates with {backend_name}...")
+
+        self._update_process = QtCore.QProcess(self)
+        self._update_process.setProgram(program)
+        self._update_process.setArguments(arguments)
+
+        self._update_process.finished.connect(self._on_update_process_finished)
+        self._update_process.errorOccurred.connect(self._on_update_process_error)
+        self._update_process.readyRead.connect(self._drain_update_process_output)
+        self._update_process.setProcessChannelMode(QtCore.QProcess.MergedChannels)
+        self._update_process.start()
+
+        self.logger.info("Starting update command: %s %s", program, " ".join(arguments))
+        return True
+
+    def _run_update_command(self, packages):
+        if not packages:
+            return
+
+        if self._update_process is not None and self._update_process.state() != QtCore.QProcess.NotRunning:
+            return
+
+        self._progress_bar.show()
+        self.status_bar.showMessage("Installing updates...")
+
+        self._update_process_output = []
+        self._update_attempt_outputs = []
+        self._update_commands = _build_update_commands(packages)
+        self._current_update_backend = None
+
+        if not self._start_next_update_command():
+            self._cleanup_update_process()
+            QtWidgets.QMessageBox.warning(
+                self,
+                "Update failed",
+                "No update commands were generated.",
+            )
+
+    def _drain_update_process_output(self, process=None):
+
+        if process is None:
+            sender = self.sender()
+            process = sender if sender is not None else self._update_process
+
+        if process is None or process is not self._update_process:
+            return
+
+        data = bytes(process.readAll())
+        if not data:
+            return
+
+        text = data.decode(errors="replace")
+        self._update_process_output.append(text)
+
+        # Optional: surface some live feedback
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        if lines:
+            latest_line = lines[-1]
+            self.status_bar.showMessage(latest_line)
+            self.logger.info(latest_line)
+
+    def _cleanup_update_process(self):
+        if self._update_process is not None:
+            self._disconnect_update_process(self._update_process)
+            self._update_process.deleteLater()
+            self._update_process = None
+
+        self._update_process_output = []
+        self._update_commands = []
+        self._update_attempt_outputs = []
+        self._current_update_backend = None
+
+        self._progress_bar.hide()
+        self.status_bar.showMessage("www.deeplabcut.org")
+
+    def _on_update_process_error(self, error):
+
+        process = self.sender()
+        if process is not self._update_process:
+            return
+
+        if self._closing:
+            self._cleanup_update_process()
+            return
+
+        backend = self._current_update_backend or "installer"
+
+        error_strings = {
+            QtCore.QProcess.FailedToStart: f"The {backend} update process failed to start.",
+            QtCore.QProcess.Crashed: f"The {backend} update process crashed unexpectedly.",
+            QtCore.QProcess.Timedout: f"The {backend} update process timed out.",
+            QtCore.QProcess.WriteError: f"Could not write to the {backend} update process.",
+            QtCore.QProcess.ReadError: f"Could not read from the {backend} update process.",
+            QtCore.QProcess.UnknownError: f"An unknown {backend} update error occurred.",
+        }
+
+        if process is not None:
+            self._drain_update_process_output(process)
+
+        output = "".join(self._update_process_output).strip()
+        message = error_strings.get(error, f"An unknown {backend} update error occurred.")
+        failed_output = f"{message}\n\n{output}" if output else message
+        self.logger.warning(failed_output)
+        self._update_attempt_outputs.append(failed_output)
+
+        self._disconnect_update_process(process)
+        process.deleteLater()
+        self._update_process = None
+        self._update_process_output = []
+
+        if self._start_next_update_command():
+            return
+
+        QtWidgets.QMessageBox.warning(
+            self,
+            "Update failed",
+            "No update backend completed successfully.\n\n" + "\n\n---\n\n".join(self._update_attempt_outputs),
+        )
+        self._cleanup_update_process()
+
+    def _on_update_process_finished(self, exit_code, exit_status):
+        process = self.sender()
+        if process is None or process is not self._update_process:
+            return
+
+        if self._closing:
+            self._cleanup_update_process()
+            return
+
+        if process is None:
+            return
+
+        self._drain_update_process_output(process)
+
+        output = "".join(self._update_process_output).strip()
+        backend = self._current_update_backend or "installer"
+
+        if exit_status == QtCore.QProcess.NormalExit and exit_code == 0:
+            QtWidgets.QMessageBox.information(
+                self,
+                "Update complete",
+                "The update completed successfully.\n\nPlease restart DeepLabCut to use the updated packages.",
+            )
+
+            if output:
+                self.logger.info(output)
+
+            self._cleanup_update_process()
+            return
+
+        failed_output = (
+            f"{backend} failed with exit code {exit_code}.\n\n{output or 'No additional output was captured.'}"
+        )
+        self._update_attempt_outputs.append(failed_output)
+        self.logger.warning(failed_output)
+
+        self._disconnect_update_process(process)
+        process.deleteLater()
+        self._update_process = None
+        self._update_process_output = []
+
+        if self._start_next_update_command():
+            return
+
+        QtWidgets.QMessageBox.warning(
+            self,
+            "Update failed",
+            "No update backend completed successfully.\n\n" + "\n\n---\n\n".join(self._update_attempt_outputs),
+        )
+
+        self._cleanup_update_process()
+
+    def _on_update_check_finished(self, result):
+        if self._closing:
+            return
+
+        silent = result.get("silent", True)
+        error = result.get("error")
+
+        if error is not None:
+            self.logger.debug(f"Update check failed with error: {error!r}")
+            if not silent:
+                QtWidgets.QMessageBox.warning(
+                    self,
+                    "Update check failed",
+                    f"Could not check for updates.\n\n{error}",
+                )
+            return
+
+        is_latest = result["is_latest"]
+        latest_version = result["latest_version"]
+        is_latest_plugin = result["is_latest_plugin"]
+        latest_plugin_version = result["latest_plugin_version"]
+
+        if is_latest and is_latest_plugin:
+            if not silent:
+                QtWidgets.QMessageBox.information(
+                    self,
+                    "Up to date",
+                    "You are using the latest version of DeepLabCut and the labeling plugin.",
+                )
+            return
+
+        parts = []
+        packages = []
+
+        if not is_latest:
+            parts.append(f"DeepLabCut {latest_version} available")
+            packages.append("deeplabcut")
+
+        if not is_latest_plugin:
+            parts.append(f"DeepLabCut labeling plugin {latest_plugin_version} available")
+            packages.append("napari-deeplabcut")
+
+        msg = QtWidgets.QMessageBox(self)
+        msg.setIcon(QtWidgets.QMessageBox.Information)
+        msg.setText("\n".join(parts))
+
+        update_btn = msg.addButton("Update", QtWidgets.QMessageBox.AcceptRole)
+        msg.addButton("Skip", QtWidgets.QMessageBox.RejectRole)
+        msg.setDefaultButton(update_btn)
+        msg.exec()
+
+        if msg.clickedButton() is update_btn:
+            self._run_update_command(packages)
+
+    def add_video_files(self, new_video_files):
+        """
+        Add new video files to the existing set of files. This method ensures no duplicates are added.
+        Emits a signal to notify about the updated set of files.
+        """
+        new_video_files = {Path(video).absolute() for video in new_video_files}
+        self.files.update(new_video_files)  # Add new items to the existing set
+        self.video_files_.emit(self.files)  # Emit the updated set of files
+        self.logger.info(f"Videos added to analyze:\n{new_video_files}\nCurrent video files:\n{self.files}")
+
+    def clear_video_files(self):
+        """
+        Clear all video files from the existing set. Emits a signal to notify the change.
+        """
+        self.files.clear()  # Reset the set to be empty
+        self.video_files_.emit(self.files)  # Emit the empty set
+        self.logger.debug("All video files have been cleared.")
+
+    def window_set(self):
+
+        self.setWindowTitle("DeepLabCut")
+
+        palette = QtGui.QPalette()
+        palette.setColor(QtGui.QPalette.Window, QtGui.QColor("#ffffff"))
+        self.setPalette(palette)
+
+        self.setWindowIcon(icon_from_resource("logo.png"))
+
+        # Set default window size and allow resizing
+        self.resize(
+            int(self.screen_width * WINDOW_RESIZE_FACTOR),
+            int(self.screen_height * WINDOW_RESIZE_FACTOR),
+        )
+        self.setMinimumSize(DEFAULT_MINIMUM_WIDTH, DEFAULT_MINIMUM_HEIGHT)
+        # self.setMaximumSize(self.screen_width, self.screen_height) # prevents proper Maximize
+        self.setWindowFlag(Qt.WindowMaximizeButtonHint, True)
+        self.setWindowFlag(Qt.WindowMinimizeButtonHint, True)
+        self.setWindowFlag(Qt.WindowCloseButtonHint, True)
+
+        self.status_bar = self.statusBar()
+        self.status_bar.setObjectName("Status Bar")
+        self.status_bar.showMessage("www.deeplabcut.org")
+
+    def _generate_welcome_page(self):
+        self.layout = QtWidgets.QVBoxLayout()
+        self.layout.setAlignment(Qt.AlignCenter | Qt.AlignTop)
+        self.layout.setSpacing(30)
+
+        title = components._create_label_widget(
+            f"Welcome to the DeepLabCut Project Manager GUI {DLC_VERSION}!",
+            "font:bold; font-size:18px;",
+            margins=(0, 30, 0, 0),
+        )
+        title.setAlignment(Qt.AlignCenter)
+        self.layout.addWidget(title)
+
+        image_widget = QtWidgets.QLabel(self)
+        image_widget.setAlignment(Qt.AlignCenter)
+        image_widget.setContentsMargins(0, 0, 0, 0)
+        pixmap = pixmap_from_resource("logo_transparent.png")
+        image_widget.setPixmap(pixmap.scaledToHeight(400, QtCore.Qt.SmoothTransformation))
+        self.layout.addWidget(image_widget)
+        description = (
+            "DeepLabCut™ is an open source tool for markerless pose estimation of "
+            "user-defined body parts with deep learning.\n"
+            "A. and M.W. Mathis Labs | http://www.deeplabcut.org\n\n"
+            "To get started, create a new project, load an existing one, or try one "
+            "of our pretrained models from the Model Zoo."
+        )
+        label = components._create_label_widget(
+            description,
+            "font-size:12px; text-align: center;",
+            margins=(0, 0, 0, 0),
+        )
+        label.setMinimumWidth(400)
+        label.setWordWrap(True)
+        label.setAlignment(Qt.AlignCenter)
+        self.layout.addWidget(label)
+
+        self.layout_buttons = QtWidgets.QHBoxLayout()
+        self.layout_buttons.setAlignment(Qt.AlignCenter | Qt.AlignCenter)
+        self.create_project_button = QtWidgets.QPushButton("Create New Project")
+        self.create_project_button.setFixedWidth(200)
+        self.create_project_button.clicked.connect(self._create_project)
+
+        self.load_project_button = QtWidgets.QPushButton("Load Project")
+        self.load_project_button.setFixedWidth(200)
+        self.load_project_button.clicked.connect(self._open_project)
+
+        self.run_superanimal_button = QtWidgets.QPushButton("Model Zoo")
+        self.run_superanimal_button.setFixedWidth(200)
+        self.run_superanimal_button.clicked.connect(self._goto_superanimal)
+
+        self.layout_buttons.addWidget(self.create_project_button)
+        self.layout_buttons.addWidget(self.load_project_button)
+        self.layout_buttons.addWidget(self.run_superanimal_button)
+
+        self.layout.addLayout(self.layout_buttons)
+
+        widget = QWidget()
+        widget.setLayout(self.layout)
+        self.setCentralWidget(widget)
+        self.check_for_updates(silent=True, delay_ms=2000)
+
+    def default_set(self):
+        self.name_default = ""
+        self.proj_default = ""
+        self.exp_default = ""
+        self.loc_default = Path.home()
+
+    def create_actions(self, names):
+        # Creating action using the first constructor
+        self.newAction = QAction(self)
+        self.newAction.setText("&New Project...")
+
+        self.newAction.setIcon(icon_from_resource("icons", names[0]))
+        self.newAction.setShortcut("Ctrl+N")
+        self.newAction.setStatusTip("Create a new project...")
+
+        self.newAction.triggered.connect(self._create_project)
+
+        # Creating actions using the second constructor
+        self.openAction = QAction("&Open...", self)
+        self.openAction.setIcon(icon_from_resource("icons", names[1]))
+        self.openAction.setShortcut("Ctrl+O")
+        self.openAction.setStatusTip("Open a project...")
+        self.openAction.triggered.connect(self._open_project)
+
+        self.saveAction = QAction("&Save", self)
+        self.exitAction = QAction("&Exit", self)
+
+        self.lightmodeAction = QAction("&Light theme", self)
+        self.lightmodeAction.triggered.connect(self.lightmode)
+        self.darkmodeAction = QAction("&Dark theme", self)
+        self.darkmodeAction.triggered.connect(self.darkmode)
+
+        self.helpAction = QAction("&Help", self)
+        self.helpAction.setIcon(icon_from_resource("icons", names[2]))
+        self.helpAction.setStatusTip("Ask for help...")
+        self.helpAction.triggered.connect(self._ask_for_help)
+
+        self.aboutAction = QAction("&Learn DLC", self)
+        self.aboutAction.triggered.connect(self._learn_dlc)
+
+        self.check_updates = QAction("&Check for Updates...", self)
+        self.check_updates.triggered.connect(lambda: self.check_for_updates(silent=False))
+
+        self.buildDebugLogAction = create_generate_debug_log_action(
+            parent=self,
+            recorder=self._debug_recorder,
+            logger_name="deeplabcut",
+            include_module_paths=False,
+            include_executable_paths=True,
+            log_limit=1000,
+        )
+
+    def create_menu_bar(self):
+        menu_bar = self.menuBar()
+
+        # File menu
+        self.file_menu = QMenu("&File", self)
+        menu_bar.addMenu(self.file_menu)
+
+        self.file_menu.addAction(self.newAction)
+        self.file_menu.addAction(self.openAction)
+
+        self.recentfiles_menu = self.file_menu.addMenu("Open Recent")
+        # self.recentfiles_menu.triggered.connect(lambda a: self._update_project_state(a.text(), True))
+        self.recentfiles_menu.triggered.connect(self._open_recent_project)
+        self.file_menu.addAction(self.saveAction)
+        self.file_menu.addAction(self.exitAction)
+
+        # View menu
+        view_menu = QMenu("&View", self)
+        mode = view_menu.addMenu("Appearance")
+        menu_bar.addMenu(view_menu)
+        mode.addAction(self.lightmodeAction)
+        mode.addAction(self.darkmodeAction)
+
+        # Help menu
+        help_menu = QMenu("&Help", self)
+        menu_bar.addMenu(help_menu)
+        help_menu.addAction(self.helpAction)
+        help_menu.addAction(self.buildDebugLogAction)
+        help_menu.addSeparator()
+        help_menu.addAction(self.check_updates)
+        help_menu.addAction(self.aboutAction)
+        help_menu.adjustSize()
+
+    def update_menu_bar(self):
+        self.file_menu.removeAction(self.newAction)
+        self.file_menu.removeAction(self.openAction)
+
+    def create_toolbar(self):
+        self.toolbar.clear()
+        self.toolbar.addAction(self.newAction)
+        self.toolbar.addAction(self.openAction)
+        self.toolbar.addAction(self.helpAction)
+
+        size_policy = QSizePolicy()  # QtWidgets.QSizePolicy.Policy.Expanding
+        size_policy.setHorizontalPolicy(QSizePolicy.Policy.Expanding)
+        spacer = QLabel()
+        spacer.setSizePolicy(size_policy)
+        spacer.setStyleSheet("background: transparent;")
+
+        engine_label = QLabel()
+        engine_label.autoFillBackground()
+        engine_label.setText("Engine")
+        engine_label.setStyleSheet("background: transparent;")
+
+        engine_icon = QLabel()
+        engine_icon.setStyleSheet("background: transparent;")
+
+        def _update_icon(engine: str):
+            file = files("deeplabcut.gui.media") / f"dlc-{engine}.png"
+            pixmap = QPixmap(str(file))
+            if not pixmap.isNull():
+                engine_icon.setPixmap(pixmap.scaled(56, 56, Qt.AspectRatioMode.KeepAspectRatio))
+
+        _update_icon("pt" if self.engine == Engine.PYTORCH else "tf")
+
+        engines = [engine for engine in Engine]
+
+        def _update_engine(index: int) -> None:
+            self.logger.info(f"Changed engine to {engines[index]}")
+            self.engine = engines[index]
+            _update_icon("pt" if self.engine == Engine.PYTORCH else "tf")
+
+        change_engine_widget = QComboBox()
+        change_engine_widget.addItems([e.aliases[0] for e in engines])
+        change_engine_widget.setFixedWidth(180)
+        change_engine_widget.currentIndexChanged.connect(_update_engine)
+        change_engine_widget.setCurrentIndex(engines.index(self.engine))
+
+        self.toolbar.addWidget(spacer)
+        self.toolbar.addWidget(engine_icon)
+        self.toolbar.addWidget(engine_label)
+        self.toolbar.addWidget(change_engine_widget)
+
+    def remove_action(self):
+        self.toolbar.removeAction(self.newAction)
+        self.toolbar.removeAction(self.openAction)
+        self.toolbar.removeAction(self.helpAction)
+
+    def _update_project_state(
+        self,
+        config: str | Path,
+        loaded: bool,
+    ) -> bool:
+        """Select a project and build its UI from the current config."""
+        self.config_path = absolute_path(config)
+        self.loaded = False
+
+        if not loaded:
+            return True
+
+        # Do not keep an old project's controls active while self.config_path
+        # points to a newly selected project.
+        self._generate_welcome_page()
+
+        if not self._build_project_ui_from_current_config():
+            return False
+
+        self.loaded = True
+        self._config_monitor.mark_current()
+        self.add_recent_filename(str(self.config_path))
+        return True
+
+    def reload_project_config(self) -> bool:
+        """Reload the active project configuration and rebuild its UI."""
+        if self.config_path is None:
+            return False
+        return self._update_project_state(self.config_path, loaded=True)
+
+    def invalidate_config_cache(self) -> None:
+        """Drop the cached project configuration so the next ``self.cfg``
+        access performs a fresh read-and-validate from disk."""
+        self._cfg = None
+
+    def _ask_for_help(self):
+        dlg = QMessageBox(self)
+        dlg.setWindowTitle("Ask for help")
+        dlg.setText("""Ask our community for help on <a href='https://forum.image.sc/tag/deeplabcut'>the forum</a>!""")
+        _ = dlg.exec()
+
+    def _learn_dlc(self):
+        dlg = QMessageBox(self)
+        dlg.setWindowTitle("Learn DLC")
+        dlg.setText(
+            "Learn DLC with "
+            "<a href='https://deeplabcut.github.io/DeepLabCut/docs/UseOverviewGuide.html'>"
+            "our docs and how-to guides</a>!"
+        )
+        _ = dlg.exec()
+
+    def _create_project(self):
+        dlg = ProjectCreator(self)
+        dlg.show()
+
+    def _open_config_with_system_application(
+        self,
+        config_path: str | Path | None = None,
+    ) -> bool:
+        """Open a config (default: the project config) with the OS default app."""
+        path = Path(config_path) if config_path is not None else self.config_path
+        if path is None:
+            return False
+
+        if not path.is_file():
+            QMessageBox.warning(
+                self,
+                "Configuration not found",
+                (f"The project configuration no longer exists:\n\n{path}"),
+            )
+            return False
+
+        config_url = QtCore.QUrl.fromLocalFile(str(path))
+        opened = QDesktopServices.openUrl(config_url)
+
+        if not opened:
+            self.logger.warning(
+                "The operating system could not open configuration %s",
+                path,
+            )
+
+        return opened
+
+    def _show_config_error(
+        self,
+        report: ConfigErrorReport,
+    ) -> ConfigErrorAction:
+        """Show a configuration error and offer external editing and reload."""
+        message = QMessageBox(self)
+        message.setIcon(QMessageBox.Critical)
+        message.setWindowTitle(report.title)
+        message.setText(report.summary)
+        message.setInformativeText(report.details)
+        message.setDetailedText(report.technical_details)
+
+        open_button = message.addButton(
+            "Open configuration",
+            QMessageBox.ActionRole,
+        )
+        reload_button = message.addButton(
+            "Reload",
+            QMessageBox.AcceptRole,
+        )
+        cancel_button = message.addButton(
+            QMessageBox.Cancel,
+        )
+
+        message.setDefaultButton(reload_button)
+
+        while True:
+            message.exec()
+            clicked_button = message.clickedButton()
+
+            # close -> cancel
+            if clicked_button is None:
+                return ConfigErrorAction.CANCEL
+
+            if clicked_button is reload_button:
+                return ConfigErrorAction.RETRY
+
+            if clicked_button is cancel_button:
+                return ConfigErrorAction.CANCEL
+
+            if clicked_button is open_button:
+                if self._open_config_with_system_application():
+                    message.setTextFormat(Qt.RichText)
+                    message.setInformativeText(
+                        f"{escape(report.details).replace(chr(10), '<br>')}<br><br>"
+                        "<b>The configuration was opened in your default application. "
+                        "Save your changes, then click Reload.</b>"
+                    )
+                else:
+                    QMessageBox.warning(
+                        self,
+                        "Could not open configuration",
+                        (
+                            "DeepLabCut could not open the configuration "
+                            "with a system application.\n\n"
+                            f"Open it manually:\n{self.config_path}"
+                        ),
+                    )
+
+    def show_task_error(
+        self,
+        error: Exception,
+        config_path: str | Path | None = None,
+    ) -> None:
+        """Show an error raised by a GUI-launched task (e.g. training, analysis).
+
+        Unlike the project-config recovery loop, this only reports the failure;
+        the user fixes the file and re-runs the action.
+        """
+        if config_path is None:
+            if isinstance(error, ValidationError) and _is_pose_config_validation_error(error):
+                config_path = self.pose_cfg_path
+            else:
+                config_path = self.config_path
+
+        self.logger.error("Task failed: %s", error, exc_info=error)
+
+        if isinstance(error, ValidationError):
+            report = format_config_error(config_path or "<unknown>", error)
+        else:
+            report = ConfigErrorReport(
+                title="Task failed",
+                summary="DeepLabCut could not complete the task.",
+                details=str(error),
+                technical_details=repr(error),
+            )
+
+        message = QMessageBox(self)
+        message.setIcon(QMessageBox.Critical)
+        message.setWindowTitle(report.title)
+        message.setText(report.summary)
+        message.setInformativeText(report.details)
+        message.setDetailedText(report.technical_details)
+
+        open_button = None
+        if config_path is not None and isinstance(error, ValidationError):
+            open_button = message.addButton(
+                "Open configuration",
+                QMessageBox.ActionRole,
+            )
+        message.addButton(QMessageBox.Close)
+
+        message.exec()
+
+        if open_button is not None and message.clickedButton() is open_button:
+            self._open_config_with_system_application(config_path)
+
+    def _handle_config_error(self, error: Exception) -> ConfigErrorAction:
+        """Log and present a recoverable project configuration error."""
+        if isinstance(error, ValidationError):
+            self.logger.warning(
+                "Invalid project configuration %s (%d validation error%s)",
+                self.config_path,
+                error.error_count(),
+                "" if error.error_count() == 1 else "s",
+            )
+        else:
+            self.logger.warning(
+                "Could not read project configuration %s: %s",
+                self.config_path,
+                error,
+            )
+
+        self.logger.debug(
+            "Project configuration error details",
+            exc_info=(
+                type(error),
+                error,
+                error.__traceback__,
+            ),
+        )
+
+        report = format_config_error(
+            self.config_path,
+            error,
+        )
+        return self._show_config_error(report)
+
+    def _build_project_ui_from_current_config(self) -> bool:
+        """Build project tabs using the current config file on disk.
+
+        Every attempt starts by invalidating the cached configuration, so
+        each retry performs a fresh read and validation from disk.
+        """
+        if self.config_path is None:
+            return False
+
+        while True:
+            self._discard_partial_project_tabs()
+            self.invalidate_config_cache()
+
+            try:
+                # Read and validate; tabs reuse the cached snapshot via self.cfg.
+                self._read_current_config_for_ui()
+                self.add_tabs()
+                return True
+
+            except CONFIG_LOAD_ERRORS as error:
+                self._discard_partial_project_tabs()
+                self._generate_welcome_page()
+                action = self._handle_config_error(error)
+
+            except Exception:
+                self._discard_partial_project_tabs()
+                self._generate_welcome_page()
+                raise
+
+            if action is ConfigErrorAction.RETRY:
+                # Loop back and perform a fresh read from disk.
+                continue
+
+            return False
+
+    def _open_project(self) -> None:
+        open_project = OpenProject(self)
+        open_project.load_config()
+        if not open_project.config_path:
+            return
+
+        self._update_project_state(
+            open_project.config_path,
+            loaded=True,
+        )
+
+    def _open_recent_project(
+        self,
+        action: QAction,
+    ) -> None:
+        """Open a recent project through the normal validation boundary."""
+        config_path = absolute_path(action.text())
+
+        if not config_path.is_file():
+            QMessageBox.warning(
+                self,
+                "Project not found",
+                (f"The project configuration no longer exists:\n\n{config_path}"),
+            )
+            self.recentfiles_menu.removeAction(action)
+            return
+
+        self._update_project_state(
+            config_path,
+            loaded=True,
+        )
+
+    def _goto_superanimal(self):
+        self.tab_widget = QtWidgets.QTabWidget()
+        self.tab_widget.setContentsMargins(0, 20, 0, 0)
+        self.modelzoo = ModelZoo(root=self, parent=None, h1_description="DeepLabCut - Model Zoo")
+        self.tab_widget.addTab(self.modelzoo, "Model Zoo")
+        self.setCentralWidget(self.tab_widget)
+
+    def _read_current_config_for_ui(self) -> ProjectConfig:
+        """Read the current config from disk for a UI-building attempt."""
+        cfg = self.cfg
+        if cfg is None:
+            raise FileNotFoundError("No project configuration is selected.")
+        return cfg
+
+    def load_config(
+        self,
+        config: str | Path,
+    ) -> bool:
+        """Reload a config from disk and notify config-dependent widgets."""
+        self.config_path = absolute_path(config)
+
+        while True:
+            self.invalidate_config_cache()
+
+            try:
+                cfg = self._read_current_config_for_ui()
+            except CONFIG_LOAD_ERRORS as error:
+                action = self._handle_config_error(error)
+
+                if action is ConfigErrorAction.RETRY:
+                    continue
+
+                return False
+
+            self.config_loaded.emit()
+
+            task = cfg.Task or self.config_path.parent.name
+            self.logger.info(
+                'Project "%s" successfully loaded.',
+                task,
+            )
+            self._config_monitor.mark_current()
+            return True
+
+    def darkmode(self):
+        dark_stylesheet = qdarkstyle.load_stylesheet_pyside2()
+        self.app.setStyleSheet(dark_stylesheet)
+
+        names = ["new_project2.png", "open2.png", "help2.png"]
+        self.remove_action()
+        self.create_actions(names)
+        self.update_menu_bar()
+        self.create_toolbar()
+
+    def lightmode(self):
+        from qdarkstyle.light.palette import LightPalette
+
+        style = qdarkstyle.load_stylesheet(palette=LightPalette)
+        self.app.setStyleSheet(style)
+
+        names = ["new_project.png", "open.png", "help.png"]
+        self.remove_action()
+        self.create_actions(names)
+        self.create_toolbar()
+        self.update_menu_bar()
+
+    def _discard_partial_project_tabs(self) -> None:
+        """Dispose of tabs created during a failed UI-building attempt."""
+        tab_widget = getattr(self, "tab_widget", None)
+
+        if tab_widget is None:
+            return
+
+        try:
+            if self.centralWidget() is tab_widget:
+                self.takeCentralWidget()
+        except RuntimeError:
+            # The Qt object may already have been scheduled for deletion.
+            pass
+
+        try:
+            tab_widget.deleteLater()
+        except RuntimeError:
+            pass
+
+        self.tab_widget = None
+
+    def add_tabs(self):
+        self.tab_widget = QtWidgets.QTabWidget()
+        self.tab_widget.setContentsMargins(0, 20, 0, 0)
+        self.manage_project = ManageProject(root=self, parent=None, h1_description="DeepLabCut - Manage Project")
+        self.extract_frames = ExtractFrames(root=self, parent=None, h1_description="DeepLabCut - Extract Frames")
+        self.label_frames = LabelFrames(root=self, parent=None, h1_description="DeepLabCut - Label Frames")
+        self.create_training_dataset = CreateTrainingDataset(
+            root=self,
+            parent=None,
+            h1_description="DeepLabCut - Step 4. Create training dataset",
+        )
+        self.train_network = TrainNetwork(
+            root=self,
+            parent=None,
+            h1_description="DeepLabCut - Train network",
+        )
+        self.evaluate_network = EvaluateNetwork(
+            root=self,
+            parent=None,
+            h1_description="DeepLabCut - Evaluate Network",
+        )
+        self.analyze_videos = AnalyzeVideos(root=self, parent=None, h1_description="DeepLabCut - Analyze Videos")
+        self.unsupervised_id_tracking = UnsupervizedIdTracking(
+            root=self,
+            parent=None,
+            h1_description="DeepLabCut - Optional Unsupervised ID Tracking with Transformer",
+        )
+        self.create_videos = CreateVideos(
+            root=self,
+            parent=None,
+            h1_description="DeepLabCut - Create Videos",
+        )
+        self.extract_outlier_frames = ExtractOutlierFrames(
+            root=self,
+            parent=None,
+            h1_description="DeepLabCut - Step 8. Extract outlier frames",
+        )
+        self.refine_tracklets = RefineTracklets(root=self, parent=None, h1_description="DeepLabCut - Refine labels")
+        self.modelzoo = ModelZoo(root=self, parent=None, h1_description="DeepLabCut - Model Zoo")
+        self.video_editor = VideoEditor(root=self, parent=None, h1_description="DeepLabCut - Optional Video Editor")
+
+        self.tab_widget.addTab(self.manage_project, "Manage project")
+        self.tab_widget.addTab(self.extract_frames, "Extract frames")
+        self.tab_widget.addTab(self.label_frames, "Label frames")
+        self.tab_widget.addTab(self.create_training_dataset, "Create training dataset")
+        self.tab_widget.addTab(self.train_network, "Train network")
+        self.tab_widget.addTab(self.evaluate_network, "Evaluate network")
+        self.tab_widget.addTab(self.analyze_videos, "Analyze videos")
+        self.tab_widget.addTab(self.unsupervised_id_tracking, "Unsupervised ID Tracking (*)")
+        self.tab_widget.addTab(self.create_videos, "Create videos")
+        self.tab_widget.addTab(self.extract_outlier_frames, "Extract outlier frames (*)")
+        self.tab_widget.addTab(self.refine_tracklets, "Refine tracklets (*)")
+        self.tab_widget.addTab(self.modelzoo, "Model Zoo")
+        self.tab_widget.addTab(self.video_editor, "Video editor (*)")
+
+        if not self.is_multianimal:
+            self.tab_widget.removeTab(self.tab_widget.indexOf(self.unsupervised_id_tracking))
+            self.tab_widget.removeTab(self.tab_widget.indexOf(self.refine_tracklets))
+
+        self.setCentralWidget(self.tab_widget)
+        self.tab_widget.currentChanged.connect(self.refresh_active_tab)
+
+    def refresh_active_tab(self):
+        active_tab = self.tab_widget.currentWidget()
+        tab_label = self.tab_widget.tabText(self.tab_widget.currentIndex())
+
+        widget_to_attribute_map = {
+            QtWidgets.QSpinBox: "setValue",
+            components.ShuffleSpinBox: "setValue",
+            components.TrainingSetSpinBox: "setValue",
+            QtWidgets.QLineEdit: "setText",
+        }
+
+        def _attempt_attribute_update(widget_name, updated_value):
+            try:
+                widget = getattr(active_tab, widget_name)
+                method = getattr(widget, widget_to_attribute_map[type(widget)])
+                self.logger.debug(f"Setting {widget_name}={updated_value} in tab '{tab_label}'")
+                method(updated_value)
+            except AttributeError:
+                pass
+
+        _attempt_attribute_update("shuffle", self.shuffle_value)
+        _attempt_attribute_update("cfg_line", str(self.config_path) if self.config_path else "")
+
+    def is_transreid_available(self):
+        if not self.is_multianimal:
+            return False
+        return find_spec("deeplabcut.pose_tracking_pytorch.transformer_reID") is not None
+
+    def closeEvent(self, event):
+        print("Exiting...")
+        answer = QtWidgets.QMessageBox.question(
+            self,
+            "Quit",
+            "Are you sure you want to quit?",
+            QtWidgets.QMessageBox.Yes | QtWidgets.QMessageBox.Cancel,
+            QtWidgets.QMessageBox.Cancel,
+        )
+        if answer == QtWidgets.QMessageBox.Yes:
+            self._closing = True
+            self.receiver.terminate()
+
+            if self._update_check_timer.isActive():
+                self._update_check_timer.stop()
+
+            if self._updater is not None:
+                self._updater.cancel()
+
+            if self._update_process is not None and self._update_process.state() != QtCore.QProcess.NotRunning:
+                self._update_process.kill()
+                self._update_process.waitForFinished(1000)
+
+            self.save_settings()
+            event.accept()
+        else:
+            event.ignore()
+            print("")

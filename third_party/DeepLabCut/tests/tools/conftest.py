@@ -1,0 +1,33 @@
+from __future__ import annotations
+
+import importlib
+from pathlib import Path
+from types import ModuleType
+
+import pytest
+
+
+def _repo_root() -> Path:
+    # tests/tools/conftest.py -> repo root is 2 levels up
+    return Path(__file__).resolve().parents[2]
+
+
+def load_selector_module() -> ModuleType:
+    root = _repo_root()
+    tools_dir = root / "tools"
+    init_file = tools_dir / "__init__.py"
+    selector_path = tools_dir / "test_selector.py"
+
+    if not selector_path.exists():
+        raise FileNotFoundError(f"Selector script not found: {selector_path}")
+
+    if not init_file.exists():
+        raise FileNotFoundError(f"tools package marker not found: {init_file}")
+
+    return importlib.import_module("tools.test_selector")
+
+
+@pytest.fixture(scope="session")
+def selector():
+    """Imported selector module (tools.test_selector)."""
+    return load_selector_module()
