@@ -287,7 +287,10 @@ def prepare_memory_replay(
     cfg = af.read_config(config)
     super_animal_cfg = af.read_plainconfig(get_super_animal_project_config_path(super_animal=superanimal_name))
 
-    if "individuals" in cfg:
+    # [TARSUS DLC-fix] read_config now always fills a default "individuals" list
+    # (core/config/project_config.py), so single-animal projects wrongly took the
+    # multi-animal branch. Decide on the project flag instead.
+    if cfg.get("multianimalproject", False):
         temp_dataset = MaDLCPoseDataset(loader.project_path, "temp_dataset", shuffle=loader.shuffle)
     else:
         temp_dataset = SingleDLCPoseDataset(loader.project_path, "temp_dataset", shuffle=loader.shuffle)

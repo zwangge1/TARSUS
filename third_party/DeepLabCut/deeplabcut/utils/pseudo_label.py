@@ -169,7 +169,10 @@ def keypoint_matching(
     cfg = af.read_config(str(config_path))
     dlc_proj_root = config_path.parent
 
-    if "individuals" in cfg:
+    # [TARSUS DLC-fix] read_config now always fills a default "individuals" list
+    # (core/config/project_config.py), so single-animal projects wrongly took the
+    # multi-animal branch. Decide on the project flag instead.
+    if cfg.get("multianimalproject", False):
         temp_dataset = MaDLCDataFrame(str(dlc_proj_root), "temp_dataset")
         max_individuals = len(cfg["individuals"])
     else:
