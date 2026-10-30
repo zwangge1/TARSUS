@@ -13,3 +13,4 @@ outputs/*
 *.h5
 *.zip
 *.tar.gz
+*.bundle
