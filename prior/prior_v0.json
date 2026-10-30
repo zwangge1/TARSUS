@@ -1,0 +1,196 @@
+{
+ "meta": {
+  "version": "v0",
+  "date": "2026-10-30",
+  "quantity": "r = [log(femur/tarsometatarsus), log(tibiotarsus/tarsometatarsus)], 3D bone lengths",
+  "joints": {
+   "femur": "hip-knee",
+   "tibiotarsus": "knee-ankle(itj)",
+   "tarsometatarsus": "ankle(itj)-foot(tmp)"
+  }
+ },
+ "priors": {
+  "species:Anas platyrhynchos": {
+   "level": "species",
+   "mu": [
+    0.1082,
+    0.59711
+   ],
+   "Sigma": [
+    [
+     0.000144,
+     -0.000288
+    ],
+    [
+     -0.000288,
+     0.0007
+    ]
+   ],
+   "n_species": 1,
+   "n_specimens": 6,
+   "sources": [
+    "Eliason2023",
+    "Watanabe2017"
+   ]
+  },
+  "genus:Anas": {
+   "level": "genus",
+   "mu": [
+    0.10616,
+    0.59697
+   ],
+   "Sigma": [
+    [
+     0.006425,
+     0.003339
+    ],
+    [
+     0.003339,
+     0.003095
+    ]
+   ],
+   "n_species": 18,
+   "n_specimens": 31,
+   "sources": [
+    "Eliason2023",
+    "Watanabe2017"
+   ]
+  },
+  "group:Anserini_geese": {
+   "level": "group",
+   "mu": [
+    -0.068,
+    0.49545
+   ],
+   "Sigma": [
+    [
+     0.004065,
+     0.002325
+    ],
+    [
+     0.002325,
+     0.002499
+    ]
+   ],
+   "n_species": 19,
+   "n_specimens": 35,
+   "sources": [
+    "Eliason2023",
+    "Watanabe2017"
+   ]
+  },
+  "genus:Cygnus": {
+   "level": "genus",
+   "mu": [
+    -0.06944,
+    0.54361
+   ],
+   "Sigma": [
+    [
+     0.00212,
+     0.001884
+    ],
+    [
+     0.001884,
+     0.003478
+    ]
+   ],
+   "n_species": 5,
+   "n_specimens": 14,
+   "sources": [
+    "Eliason2023",
+    "Watanabe2017"
+   ]
+  },
+  "genus:Pelecanus": {
+   "level": "genus",
+   "mu": [
+    -0.04079,
+    0.35023
+   ],
+   "Sigma": [
+    [
+     0.012458,
+     0.000462
+    ],
+    [
+     0.000462,
+     0.006843
+    ]
+   ],
+   "n_species": 5,
+   "n_specimens": 15,
+   "sources": [
+    "Eliason2023"
+   ]
+  },
+  "family:Anatidae": {
+   "level": "family",
+   "mu": [
+    0.05753,
+    0.57099
+   ],
+   "Sigma": [
+    [
+     0.015598,
+     0.00912
+    ],
+    [
+     0.00912,
+     0.007192
+    ]
+   ],
+   "n_species": 128,
+   "n_specimens": 274,
+   "sources": [
+    "Eliason2023",
+    "Watanabe2017"
+   ]
+  },
+  "family:Pelecanidae": {
+   "level": "family",
+   "mu": [
+    -0.04079,
+    0.35023
+   ],
+   "Sigma": [
+    [
+     0.012458,
+     0.000462
+    ],
+    [
+     0.000462,
+     0.006843
+    ]
+   ],
+   "n_species": 5,
+   "n_specimens": 15,
+   "sources": [
+    "Eliason2023"
+   ]
+  },
+  "global:Aves": {
+   "level": "global",
+   "mu": [
+    -0.03184,
+    0.47126
+   ],
+   "Sigma": [
+    [
+     0.115573,
+     0.067365
+    ],
+    [
+     0.067365,
+     0.050476
+    ]
+   ],
+   "n_species": 1285,
+   "n_specimens": 2645,
+   "sources": [
+    "Eliason2023",
+    "Watanabe2017"
+   ]
+  }
+ }
+}

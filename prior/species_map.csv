@@ -1,0 +1,62 @@
+folder,video_id,prior_key
+Duck_1,Duck_1,species:Anas platyrhynchos
+Duck_17,Duck_17,species:Anas platyrhynchos
+Duck_17_labeled,Duck_17,species:Anas platyrhynchos
+Duck_1_final,Duck_1,species:Anas platyrhynchos
+Duck_1_final_v,Duck_1,species:Anas platyrhynchos
+Duck_1_labeled,Duck_1,species:Anas platyrhynchos
+Duck_20,Duck_20,species:Anas platyrhynchos
+Duck_20_labeled,Duck_20,species:Anas platyrhynchos
+Duck_26_final,Duck_26,species:Anas platyrhynchos
+Duck_28,Duck_28,species:Anas platyrhynchos
+Duck_28_labeled,Duck_28,species:Anas platyrhynchos
+Duck_30_flip,Duck_30,species:Anas platyrhynchos
+Duck_30_flip_labeled,Duck_30,species:Anas platyrhynchos
+Duck_5,Duck_5,species:Anas platyrhynchos
+Duck_5_labeled,Duck_5,species:Anas platyrhynchos
+Duck_6,Duck_6,species:Anas platyrhynchos
+Duck_6_final,Duck_6,species:Anas platyrhynchos
+Duck_6_labeled,Duck_6,species:Anas platyrhynchos
+Duck_7_final,Duck_7,species:Anas platyrhynchos
+Duck_8,Duck_8,species:Anas platyrhynchos
+Goose_11,Goose_11,group:Anserini_geese
+Goose_11_labeled,Goose_11,group:Anserini_geese
+Goose_20,Goose_20,group:Anserini_geese
+Goose_20_labeled,Goose_20,group:Anserini_geese
+Goose_22,Goose_22,group:Anserini_geese
+Goose_22_labeled,Goose_22,group:Anserini_geese
+Goose_27,Goose_27,group:Anserini_geese
+Goose_27_final,Goose_27,group:Anserini_geese
+Goose_27_labeled,Goose_27,group:Anserini_geese
+Goose_2_final,Goose_2,group:Anserini_geese
+Goose_3a,Goose_3,group:Anserini_geese
+Goose_3a_labeled,Goose_3,group:Anserini_geese
+Goose_3b,Goose_3,group:Anserini_geese
+Goose_3b_final,Goose_3,group:Anserini_geese
+Pelican_13,Pelican_13,genus:Pelecanus
+Pelican_13_final,Pelican_13,genus:Pelecanus
+Pelican_13_labeled,Pelican_13,genus:Pelecanus
+Pelican_20,Pelican_20,genus:Pelecanus
+Pelican_20_labeled,Pelican_20,genus:Pelecanus
+Pelican_22,Pelican_22,genus:Pelecanus
+Pelican_22_final,Pelican_22,genus:Pelecanus
+Pelican_22_labeled,Pelican_22,genus:Pelecanus
+Pelican_24,Pelican_24,genus:Pelecanus
+Pelican_24_labeled,Pelican_24,genus:Pelecanus
+Pelican_26,Pelican_26,genus:Pelecanus
+Pelican_26_labeled,Pelican_26,genus:Pelecanus
+Pelican_27_final,Pelican_27,genus:Pelecanus
+Swan_13,Swan_13,genus:Cygnus
+Swan_13_labeled,Swan_13,genus:Cygnus
+Swan_14,Swan_14,genus:Cygnus
+Swan_14_final,Swan_14,genus:Cygnus
+Swan_14_labeled,Swan_14,genus:Cygnus
+Swan_25a_noaudio,Swan_25,genus:Cygnus
+Swan_32,Swan_32,genus:Cygnus
+Swan_32_final,Swan_32,genus:Cygnus
+Swan_32_labeled,Swan_32,genus:Cygnus
+Swan_5,Swan_5,genus:Cygnus
+Swan_5_final,Swan_5,genus:Cygnus
+Swan_5_labeled,Swan_5,genus:Cygnus
+Swan_8,Swan_8,genus:Cygnus
+Swan_8_labeled,Swan_8,genus:Cygnus

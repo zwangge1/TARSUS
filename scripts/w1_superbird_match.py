@@ -80,9 +80,12 @@ def main() -> None:
     from deeplabcut.utils.pseudo_label import keypoint_matching
 
     mr = out / "project" / "memory_replay"
-    if mr.exists():
-        shutil.rmtree(mr)
-    keypoint_matching(str(cfg_path), SA, SA_POSE, SA_DET, device=args.device)
+    if (mr / "conversion_table.csv").exists():
+        print("reuse existing official conversion table")
+    else:
+        if mr.exists():
+            shutil.rmtree(mr)
+        keypoint_matching(str(cfg_path), SA, SA_POSE, SA_DET, device=args.device)
     print("official conversion table:", mr / "conversion_table.csv")
 
     # 2. official SA inference on every labeled frame
@@ -93,14 +96,19 @@ def main() -> None:
     labels = labels[~labels.index.duplicated()]
     images = [p for p in labels.index if Path(p).exists()]
     print(f"labeled frames: {len(labels)}, found on disk: {len(images)}")
-    preds = superanimal_analyze_images(
-        SA, SA_POSE, SA_DET, images, max_individuals=1,
-        out_folder=out / "sa_labeled_images", device=args.device,
-        pose_threshold=0.1, bbox_threshold=0.1,
-    )
     sa_names = load_super_animal_config(SA, SA_POSE, SA_DET)["metadata"]["bodyparts"]
-    with (out / "sa_predictions.json").open("w") as f:
-        json.dump({k: {kk: np.asarray(vv).tolist() for kk, vv in v.items()} for k, v in preds.items()}, f)
+    pred_file = out / "sa_predictions.json"
+    if pred_file.exists():
+        print("reuse existing SA predictions")
+        preds = json.loads(pred_file.read_text())
+    else:
+        preds = superanimal_analyze_images(
+            SA, SA_POSE, SA_DET, images, max_individuals=1,
+            out_folder=out / "sa_labeled_images", device=args.device,
+            pose_threshold=0.1, bbox_threshold=0.1,
+        )
+        with pred_file.open("w") as f:
+            json.dump({k: {kk: np.asarray(vv).tolist() for kk, vv in v.items()} for k, v in preds.items()}, f)
 
     # 3. distances between SA leg points and Duong leg points
     rows = []
@@ -115,6 +123,8 @@ def main() -> None:
         if len(valid) < 2:
             continue
         diag = float(np.hypot(*(valid.max() - valid.min()).values))
+        if diag < 1.0:  # degenerate label set (all points on one spot)
+            continue
         for sp in SA_LEG:
             sx, sy, sc = kp[sa_names.index(sp)]
             for dp in DUONG_LEG:
