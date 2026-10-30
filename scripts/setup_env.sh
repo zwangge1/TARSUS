@@ -37,8 +37,11 @@ PY="$ENV/bin/python"
 echo "== pip install -e third_party/DeepLabCut"
 "$PY" -m pip install -i https://pypi.org/simple -e "$REPO/third_party/DeepLabCut" || exit 1
 
-# 3. import check
+# 3. import check (env.sh puts the env's own libnvJitLink first)
+source "$REPO/scripts/env.sh"
 echo "== import check"
+echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
+"$PY" -m pip list 2>/dev/null | grep -i -E "^torch |nvjitlink|cusparse"
 "$PY" - <<'EOF' || exit 1
 import torch, deeplabcut
 print("deeplabcut", deeplabcut.__version__, "from", deeplabcut.__file__)
